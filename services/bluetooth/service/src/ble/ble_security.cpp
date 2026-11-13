@@ -26,6 +26,7 @@
 #include "compat.h"
 #include "log.h"
 #include "securec.h"
+#include "timer.h"
 
 namespace OHOS {
 namespace bluetooth {
@@ -33,6 +34,9 @@ struct BleSecurity::impl {
 public:
     uint8_t pairMethod_ = 0;
     std::map<int, func> funcMap_ {};
+    std::shared_ptr<PendingOobPair> oobPair_ = std::make_shared<PendingOobPair>();
+    std::unique_ptr<utility::Timer> oobTimer_;
+
 };
 BleSecurity::BleSecurity(
     IAdapterBle &bleAdapter, utility::Dispatcher &dispatch, BaseObserverList<IAdapterBleObserver> &observer)
@@ -635,7 +639,7 @@ bool BleSecurity::GapRequestSigningAlgorithmInfoEvt(const BleGapCallbackParam &p
     return ret;
 }
 
-bool BleSecurity::LePairFeatureReq(const BleGapCallbackParam &param)
+bool BleSecurity::LePairFeatureReq(const BleGapCallbackParam &param) const
 {
     RawAddress addr = RawAddress::ConvertToString(param.lePairFeatureReq_.peerAddr.addr);
     GapLePairFeature feature;
@@ -661,6 +665,15 @@ bool BleSecurity::LePairFeatureReq(const BleGapCallbackParam &param)
         }
     }
 
+    const auto &peer = param.lePairFeatureReq_.peerAddr;
+    const int oobState = pimpl->oobPair_->State(peer.addr, peer.type);
+    if (oobState == 2 || (oobState == 1 &&
+        (pimpl->oobPair_->Curve(peer.addr, peer.type) != 2 || !(feature.authReq & GAP_LE_AUTH_REQ_BIT_SC)))) {
+        pimpl->oobPair_->Invalidate(peer.addr);
+        (void)GAPIF_LeCancelPair(&peer);
+        return false;
+    }
+    feature.oobDataFlag = oobState == 1 ? GAP_LE_OOB_DATA_PRESENT : 0;
     feature.respKeyDis = GAP_LE_KEY_DIST_ENC_KEY | GAP_LE_KEY_DIST_ID_KEY | GAP_LE_KEY_DIST_SIGN_KEY;
     feature.initKeyDis = GAP_LE_KEY_DIST_ENC_KEY | GAP_LE_KEY_DIST_ID_KEY | GAP_LE_KEY_DIST_SIGN_KEY;
 
@@ -762,28 +775,29 @@ bool BleSecurity::GapLePairPassKeyNotification(const BleGapCallbackParam &param)
 
 bool BleSecurity::GapLePairOobReq(const BleGapCallbackParam &param) const
 {
-    LOG_DEBUG("[BleSecurity] %{public}s", __func__);
-
-    RawAddress addr = RawAddress::ConvertToString(param.lePairOobReq_.addr.addr);
-    uint8_t pairMethod = pimpl->pairMethod_;
-    if (baseCallback_ != nullptr) {
-        baseCallback_->ForEach([addr, pairMethod](IAdapterBleObserver &observer) {
-            observer.OnPairConfirmed(BTTransport::ADAPTER_BLE, addr, pairMethod, 0);
-        });
-    }
-    return true;
+    const auto &peer = param.lePairOobReq_.addr;
+    // The SDK supplies elliptic-curve C/R, not the legacy LE Temporary Key.
+    pimpl->oobPair_->Invalidate(peer.addr);
+    uint8_t unused[GAP_OOB_DATA_SIZE] {};
+    const int ret = GAPIF_LePairOobRsp(&peer, GAP_NOT_ACCEPT, unused);
+    return ret == BT_SUCCESS;
 }
 
 bool BleSecurity::GapLePairScOobReq(const BleGapCallbackParam &param) const
 {
-    LOG_DEBUG("[BleSecurity] %{public}s", __func__);
-
-    RawAddress addr = RawAddress::ConvertToString(param.lePairScOob_req_.addr.addr);
-    uint8_t pairMethod = pimpl->pairMethod_;
-    if (baseCallback_ != nullptr) {
-        baseCallback_->ForEach([addr, pairMethod](IAdapterBleObserver &observer) {
-            observer.OnPairConfirmed(BTTransport::ADAPTER_BLE, addr, pairMethod, 0);
-        });
+    const auto &peer = param.lePairScOob_req_.addr;
+    PairingOobData data;
+    const bool available = pimpl->oobPair_->Take(peer.addr, peer.type, data) && data.curve == 2 && data.hasRandomizer;
+    const int ret = GAPIF_LePairScOobRsp(&peer, available ? GAP_ACCEPT : GAP_NOT_ACCEPT,
+        data.confirmation.data(), data.randomizer.data());
+    if (ret != BT_SUCCESS || !available) {
+        pimpl->oobPair_->Invalidate(peer.addr);
+        (void)GAPIF_LeCancelPair(&peer);
+        if (bleAdapter_ != nullptr) {
+            static_cast<BleAdapter *>(bleAdapter_)->LePairComplete(RawAddress::ConvertToString(peer.addr),
+                ret == BT_SUCCESS ? BT_BAD_PARAM : ret);
+        }
+        return false;
     }
     return true;
 }
@@ -807,6 +821,7 @@ bool BleSecurity::GapLePairComplete(const BleGapCallbackParam &param) const
 {
     LOG_DEBUG("[BleSecurity] %{public}s", __func__);
 
+    pimpl->oobPair_->Complete(param.lePairComplete_.addr.addr);
     RawAddress addr = RawAddress::ConvertToString(param.lePairComplete_.addr.addr);
 
     if (param.lePairComplete_.result == BT_SUCCESS) {
@@ -892,6 +907,32 @@ int BleSecurity::DeregisterCallbackToGap() const
     return ret;
 }
 
+void BleSecurity::SetOobEnabled(bool enabled)
+{
+    pimpl->oobPair_->SetEnabled(enabled);
+}
+
+bool BleSecurity::StartPairOutOfBand(const RawAddress &device, const PairingOobData &data)
+{
+    std::array<uint8_t, 6> peer {};
+    device.ConvertToUint8(peer.data());
+    if (data.peer != peer || data.addressType > BT_RANDOM_DEVICE_ADDRESS || data.curve != 2 ||
+        !data.hasRandomizer || !pimpl->oobPair_->Arm(data)) {
+        return false;
+    }
+    const auto weak = std::weak_ptr<PendingOobPair>(pimpl->oobPair_);
+    pimpl->oobTimer_ = std::make_unique<utility::Timer>([weak]() {
+        if (auto session = weak.lock()) {
+            session->Expire();
+        }
+    });
+    if (!pimpl->oobTimer_->Start(PendingOobPair::TIMEOUT_MS) || !StartPair(device, data.addressType)) {
+        pimpl->oobPair_->Complete(data.peer.data());
+        return false;
+    }
+    return true;
+}
+
 bool BleSecurity::StartPair(const RawAddress &device, uint8_t peerAddrType)
 {
     LOG_DEBUG("[BleSecurity] %{public}s", __func__);
@@ -947,6 +988,7 @@ int BleSecurity::CancelPairing(const RawAddress &device) const
     uint8_t peerAddrType = (uint8_t)bleAdapter_->GetPeerDeviceAddrType(device);
     BtAddr addr = {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, peerAddrType};
     device.ConvertToUint8(addr.addr);
+    pimpl->oobPair_->Invalidate(addr.addr);
     return GAPIF_LeCancelPair(&addr);
 }
 }  // namespace bluetooth

@@ -241,6 +241,10 @@ void BleAdapter::Disable()
 {
     LOG_DEBUG("[BleAdapter] %{public}s:%{public}s", __func__, Name().c_str());
 
+    {
+        std::lock_guard<std::recursive_mutex> lock(pimpl->syncMutex_);
+        if (pimpl->bleSecurity_ != nullptr) pimpl->bleSecurity_->SetOobEnabled(false);
+    }
     GetDispatcher()->PostTask(std::bind(&BleAdapter::DisableTask, this));
 }
 
@@ -664,6 +668,27 @@ bool BleAdapter::StartPair(const RawAddress &device)
     return true;
 }
 
+bool BleAdapter::StartPairOutOfBand(const RawAddress &device, const PairingOobData &data)
+{
+    std::lock_guard<std::recursive_mutex> lock(pimpl->syncMutex_);
+    if (!pimpl->btmEnableFlag_ || pimpl->bleSecurity_ == nullptr || data.addressType > BT_RANDOM_DEVICE_ADDRESS) {
+        return false;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> peerLock(pimpl->peerDevlistMutex_);
+        auto peer = pimpl->peerConnDeviceList_.find(device.GetAddress());
+        if (peer != pimpl->peerConnDeviceList_.end() &&
+            (peer->second.GetAddressType() != data.addressType || peer->second.GetPairedStatus() == BLE_PAIR_PAIRING)) {
+            return false;
+        }
+    }
+    if (!pimpl->bleSecurity_->StartPairOutOfBand(device, data)) {
+        return false;
+    }
+    LePairingStatus(device);
+    return true;
+}
+
 bool BleAdapter::CancelPairing(const RawAddress &device)
 {
     HILOGI("addr: %{public}s", GetEncryptAddr(device.GetAddress()).c_str());
@@ -1080,6 +1105,7 @@ void BleAdapter::RegisterBleSecurityCallback(BaseObserverList<IAdapterBleObserve
     } else {
         pimpl->bleSecurity_->RegisterCallbackToGap();
     }
+    pimpl->bleSecurity_->SetOobEnabled(pimpl->btmEnableFlag_);
 }
 
 void BleAdapter::DeregisterBleSecurityCallback() const

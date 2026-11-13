@@ -33,6 +33,10 @@
 #ifndef INTERFACE_ADAPTER_H
 #define INTERFACE_ADAPTER_H
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -60,6 +64,135 @@ namespace bluetooth {
  *
  * @since 6
  */
+// Peer bytes use the stack's little-endian BtAddr order. C/R octets retain
+// their supplied order. Only one selected SDK curve is sent over existing IPC.
+struct PairingOobData {
+    PairingOobData() = default;
+    PairingOobData(const PairingOobData &) = default;
+    PairingOobData &operator=(const PairingOobData &) = default;
+    std::array<uint8_t, 6> peer {};
+    uint8_t addressType = 0;
+    uint8_t curve = 0;
+    std::array<uint8_t, 16> confirmation {};
+    std::array<uint8_t, 16> randomizer {};
+    bool hasRandomizer = false;
+
+    void Clear()
+    {
+        // Do not leave OOB credentials in a consumed or expired service slot.
+        volatile uint8_t *c = confirmation.data();
+        volatile uint8_t *r = randomizer.data();
+        for (size_t i = 0; i < confirmation.size(); ++i) {
+            c[i] = 0;
+            r[i] = 0;
+        }
+        curve = 0;
+        hasRandomizer = false;
+    }
+    ~PairingOobData() { Clear(); }
+};
+
+class PendingOobPair {
+public:
+    static constexpr int TIMEOUT_MS = 60000;
+    // A consumed/cancelled/expired pair stays reserved until the real terminal
+    // GAP event; a delayed request must not consume a new pair for that peer.
+    bool Arm(const PairingOobData &data)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ExpireLocked();
+        if (!enabled_ || active_) {
+            return false;
+        }
+        peer_ = data.peer;
+        addressType_ = data.addressType;
+        data_ = data;
+        active_ = available_ = true;
+        expires_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(TIMEOUT_MS);
+        return true;
+    }
+    // 0: unrelated pair, 1: live OOB data, 2: OOB pair with invalid/used data.
+    int State(const uint8_t *peer, uint8_t addressType)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ExpireLocked();
+        if (!Matches(peer)) {
+            return 0;
+        }
+        return enabled_ && available_ && addressType == addressType_ ? 1 : 2;
+    }
+    uint8_t Curve(const uint8_t *peer, uint8_t addressType)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ExpireLocked();
+        return enabled_ && available_ && Matches(peer) && addressType == addressType_ ? data_.curve : 0;
+    }
+    bool Take(const uint8_t *peer, uint8_t addressType, PairingOobData &data)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ExpireLocked();
+        if (!enabled_ || !available_ || !Matches(peer) || addressType != addressType_) {
+            return false;
+        }
+        data = data_;
+        data_.Clear();
+        available_ = false;
+        return true;
+    }
+    void Invalidate(const uint8_t *peer)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (Matches(peer)) {
+            data_.Clear();
+            available_ = false;
+        }
+    }
+    void Complete(const uint8_t *peer)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (Matches(peer)) {
+            ClearLocked();
+        }
+    }
+    void SetEnabled(bool enabled)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ClearLocked();
+        enabled_ = enabled;
+    }
+    void Expire()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ExpireLocked();
+    }
+private:
+    bool Matches(const uint8_t *peer) const
+    {
+        return active_ && peer != nullptr && std::equal(peer_.begin(), peer_.end(), peer);
+    }
+    void ExpireLocked()
+    {
+        if (available_ && std::chrono::steady_clock::now() >= expires_) {
+            data_.Clear();
+            available_ = false;
+        }
+    }
+    void ClearLocked()
+    {
+        data_.Clear();
+        peer_.fill(0);
+        active_ = available_ = false;
+    }
+    std::mutex mutex_;
+    PairingOobData data_;
+    std::array<uint8_t, 6> peer_ {};
+    uint8_t addressType_ = 0;
+    bool enabled_ = false;
+    bool active_ = false;
+    bool available_ = false;
+    std::chrono::steady_clock::time_point expires_ {};
+};
+
 class IAdapter {
 public:
     /**
@@ -269,6 +402,9 @@ public:
      * @since 6
      */
     virtual utility::Context *GetContext() = 0;
+
+    // Internal service extension; rebuild the adapter interface consumers together.
+    virtual bool StartPairOutOfBand(const RawAddress &, const PairingOobData &) { return false; }
 };
 }  // namespace bluetooth
 }  // namespace OHOS

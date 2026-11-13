@@ -46,6 +46,8 @@ public:
     virtual ~BleSecurity();
 
     static bool StartPair(const RawAddress &device, uint8_t peerAddrType = BT_PUBLIC_DEVICE_ADDRESS);
+    bool StartPairOutOfBand(const RawAddress &device, const PairingOobData &data);
+    void SetOobEnabled(bool enabled);
     int SetDevicePasskey(const RawAddress &device, int passkey, int accept) const;
     int SetUserConfirm(const RawAddress &device, int accept) const;
     int GapLeRequestSecurity(uint16_t connectionHandle, const BtAddr &addr, uint8_t role);
@@ -115,7 +117,7 @@ private:
     bool GapLePairComplete(const BleGapCallbackParam &param) const;
     bool GapLePairKeyNotify(const BleGapCallbackParam &param) const;
     bool GapLeRequestSecurityResultEvt(const BleGapCallbackParam &param) const;
-    static bool LePairFeatureReq(const BleGapCallbackParam &param);
+    bool LePairFeatureReq(const BleGapCallbackParam &param) const;
 
     void InitGapEventFuncTable() const;
 

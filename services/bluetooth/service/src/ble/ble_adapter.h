@@ -106,6 +106,7 @@ public:
     std::vector<RawAddress> GetPairedDevices() const override;
     std::vector<RawAddress> GetConnectedDevices() const;
     bool StartPair(const RawAddress &device) override;
+    bool StartPairOutOfBand(const RawAddress &device, const PairingOobData &data) override;
     bool CancelPairing(const RawAddress &device) override;
     bool RemovePair(const RawAddress &device) override;
     bool RemoveAllPairs() override;

@@ -139,6 +139,8 @@ public:
      *         returns <b>false</b> if the operation fails.
      */
     bool StartPair(const RawAddress &device) override;
+    bool StartPairOutOfBand(const RawAddress &device, const PairingOobData &data) override;
+    void ReplyRemoteOob(const BtAddr &addr);
 
     /**
      * @brief Check if remote device was bonded from local.

@@ -421,6 +421,8 @@ BTSTACK_API int GAPIF_UserPasskeyRsp(const BtAddr *addr, uint8_t accept, uint32_
  *              @c otherwise        : The function is not executed successfully.
  */
 BTSTACK_API int GAPIF_RemoteOobRsp(const BtAddr *addr, uint8_t accept, const GapOOBData *data);
+BTSTACK_API int GAPIF_RemoteOobExtendedRsp(const BtAddr *addr, uint8_t accept,
+    const GapOOBData *data192, const GapOOBData *data256);
 
 /**
  * @brief       Respond PIN code request. Reply callback GapAuthenticationCallback::pinCodeReq

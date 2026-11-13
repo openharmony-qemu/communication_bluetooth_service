@@ -1406,6 +1406,36 @@ int GAP_RemoteOobRsp(const BtAddr *addr, uint8_t accept, const GapOOBData *data)
     return ret;
 }
 
+int GAP_RemoteOobExtendedRsp(const BtAddr *addr, uint8_t accept,
+    const GapOOBData *data192, const GapOOBData *data256)
+{
+    if (!GapIsBredrEnable()) {
+        return GAP_ERR_NOT_ENABLE;
+    }
+    if (addr == NULL || addr->type != BT_PUBLIC_DEVICE_ADDRESS) {
+        return GAP_ERR_INVAL_PARAM;
+    }
+    if (accept == GAP_NOT_ACCEPT) {
+        return GapRemoteOOBDataRequestNegativeReply(addr);
+    }
+    if (accept != GAP_ACCEPT || (data192 == NULL && data256 == NULL)) {
+        return GAP_ERR_INVAL_PARAM;
+    }
+    HciRemoteOobExtendedDataRequestReplyParam command = {0};
+    (void)memcpy_s(command.bdAddr.raw, sizeof(command.bdAddr.raw), addr->addr, BT_ADDRESS_SIZE);
+    if (data192 != NULL) {
+        (void)memcpy_s(command.c192, sizeof(command.c192), data192->C, GAP_OOB_DATA_CONFIRM_SIZE);
+        (void)memcpy_s(command.r192, sizeof(command.r192), data192->R, GAP_OOB_DATA_RANDOM_SIZE);
+    }
+    if (data256 != NULL) {
+        (void)memcpy_s(command.c256, sizeof(command.c256), data256->C, GAP_OOB_DATA_CONFIRM_SIZE);
+        (void)memcpy_s(command.r256, sizeof(command.r256), data256->R, GAP_OOB_DATA_RANDOM_SIZE);
+    }
+    int ret = HCI_RemoteOOBExtendedDataRequestReply(&command);
+    (void)memset_s(&command, sizeof(command), 0, sizeof(command));
+    return ret;
+}
+
 static int GapPINCodeRequestReply(const BtAddr *addr, uint8_t pinCode[GAP_PINCODE_SIZE], uint8_t pinCodeLength)
 {
     HciPinCodeRequestReplyParam hciCmdParam;

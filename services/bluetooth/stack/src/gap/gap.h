@@ -229,6 +229,8 @@ int GAP_UserPasskeyRsp(const BtAddr *addr, uint8_t accept, uint32_t number);
  *              @c otherwise        : The function is not executed successfully.
  */
 int GAP_RemoteOobRsp(const BtAddr *addr, uint8_t accept, const GapOOBData *data);
+int GAP_RemoteOobExtendedRsp(const BtAddr *addr, uint8_t accept,
+    const GapOOBData *data192, const GapOOBData *data256);
 
 /**
  * @brief       Respond PIN code request. Reply callback GapAuthenticationCallback::pinCodeReq

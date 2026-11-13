@@ -36,6 +36,9 @@ struct ClassicAdapter::impl {
     std::recursive_mutex syncMutex_ {};
     BaseObserverList<IAdapterClassicObserver> adapterObservers_ {};
     BaseObserverList<IClassicRemoteDeviceObserver> remoteObservers_ {};
+    std::shared_ptr<PendingOobPair> oobPair_ = std::make_shared<PendingOobPair>();
+    std::unique_ptr<utility::Timer> oobTimer_;
+
 };
 
 ClassicAdapter::ClassicAdapter()
@@ -91,6 +94,7 @@ void ClassicAdapter::StartUp()
     ClassicUtils::CheckReturnValue("ClassicAdapter", "SetSecurityMode", ret);
 
     LoadPairedDeviceInfo();
+    pimpl->oobPair_->SetEnabled(ret);
 
     GetContext()->OnEnable(ADAPTER_NAME_CLASSIC, ret);
 }
@@ -99,6 +103,8 @@ void ClassicAdapter::Disable()
 {
     HILOGI("%{public}s Disable", Name().c_str());
 
+    std::lock_guard<std::recursive_mutex> lock(pimpl->syncMutex_);
+    pimpl->oobPair_->SetEnabled(false);
     GetDispatcher()->PostTask(std::bind(&ClassicAdapter::ShutDown, this));
 }
 
@@ -761,8 +767,6 @@ void ClassicAdapter::RemoteOobReqCallback(const BtAddr *addr, void *context)
 {
     HILOGI("enter");
 
-    /// OOB Pair not support for current framework api.
-    /// This is used for extending.
     GapCallbackParam param = {};
     (void)memcpy_s((void *)&param.remoteOobReqParam_.addr, sizeof(BtAddr), addr, sizeof(BtAddr));
 
@@ -956,8 +960,7 @@ void ClassicAdapter::HandleSecurityEvent(GAP_CB_EVENT event, const GapCallbackPa
             PinCodeReq(param.pinCodeReqParam_.addr);
             break;
         case GAP_REMOTE_OOB_REQ_EVT:
-            /// OOB Pair not support for current framework api.
-            /// This is used for extending.
+            ReplyRemoteOob(param.remoteOobReqParam_.addr);
             break;
         case GAP_IO_CAPABILITY_REQ_EVT:
             SetIoCapability(param.ioCapabilityReqParam_.addr);
@@ -1556,6 +1559,7 @@ void ClassicAdapter::ReceiveLinkKeyNotification(
 
 void ClassicAdapter::ReceiveSimplePairComplete(const BtAddr &addr, uint8_t status)
 {
+    if (status != SUCCESS) pimpl->oobPair_->Invalidate(addr.addr);
     HILOGI("status: %{public}u", status);
 
     std::lock_guard<std::recursive_mutex> lk(pimpl->syncMutex_);
@@ -1585,6 +1589,7 @@ void ClassicAdapter::DeleteLinkKey(std::shared_ptr<ClassicRemoteDevice> remoteDe
 
 void ClassicAdapter::ReceiveAuthenticationComplete(const BtAddr &addr, uint8_t status)
 {
+    pimpl->oobPair_->Complete(addr.addr);
     HILOGI("status: %{public}u", status);
 
     std::lock_guard<std::recursive_mutex> lk(pimpl->syncMutex_);
@@ -1842,18 +1847,76 @@ bool ClassicAdapter::StartPair(const RawAddress &device)
     return true;
 }
 
+bool ClassicAdapter::StartPairOutOfBand(const RawAddress &device, const PairingOobData &data)
+{
+    std::lock_guard<std::recursive_mutex> lock(pimpl->syncMutex_);
+    BtAddr peer = ConvertToBtAddr(device);
+    if (!std::equal(data.peer.begin(), data.peer.end(), peer.addr)) return false;
+    if (isDisable_ || !btmEnableSuccess_ || data.addressType != BT_PUBLIC_DEVICE_ADDRESS ||
+        (data.curve != GAP_OOB_DATA_PRESENT_P192 && data.curve != GAP_OOB_DATA_PRESENT_P256) ||
+        !data.hasRandomizer || !pimpl->oobPair_->Arm(data)) {
+        return false;
+    }
+    const auto weak = std::weak_ptr<PendingOobPair>(pimpl->oobPair_);
+    pimpl->oobTimer_ = std::make_unique<utility::Timer>([weak]() {
+        if (auto session = weak.lock()) {
+            session->Expire();
+        }
+    });
+    if (!pimpl->oobTimer_->Start(PendingOobPair::TIMEOUT_MS) || !StartPair(device)) {
+        pimpl->oobPair_->Complete(data.peer.data());
+        return false;
+    }
+    return true;
+}
+
+void ClassicAdapter::ReplyRemoteOob(const BtAddr &addr)
+{
+    PairingOobData data;
+    const bool available = pimpl->oobPair_->Take(addr.addr, addr.type, data);
+    GapOOBData gapData {};
+    if (available) {
+        (void)memcpy_s(gapData.C, sizeof(gapData.C), data.confirmation.data(), data.confirmation.size());
+        (void)memcpy_s(gapData.R, sizeof(gapData.R), data.randomizer.data(), data.randomizer.size());
+    }
+    int ret;
+    if (available && data.curve == GAP_OOB_DATA_PRESENT_P256) {
+        ret = GAPIF_RemoteOobExtendedRsp(&addr, GAP_ACCEPT, nullptr, &gapData);
+    } else {
+        ret = GAPIF_RemoteOobRsp(&addr, available ? GAP_ACCEPT : GAP_NOT_ACCEPT, &gapData);
+    }
+    (void)memset_s(&gapData, sizeof(gapData), 0, sizeof(gapData));
+    if (ret != BT_SUCCESS || !available) {
+        pimpl->oobPair_->Invalidate(addr.addr);
+        (void)GAPIF_CancelAuthenticationReq(&addr);
+        RawAddress device = RawAddress::ConvertToString(addr.addr);
+        auto remote = FindRemoteDevice(device);
+        if (remote != nullptr && remote->GetPairedStatus() == PAIR_PAIRING) {
+            remote->SetPairedStatus(PAIR_NONE);
+            SendPairStatusChanged(ADAPTER_BREDR, device, PAIR_NONE);
+        }
+        ClassicUtils::CheckReturnValue("ClassicAdapter", "ReplyRemoteOob", false);
+    }
+}
+
 bool ClassicAdapter::CancelPairing(const RawAddress &device)
 {
     HILOGI("enter");
 
     std::lock_guard<std::recursive_mutex> lk(pimpl->syncMutex_);
     auto it = devices_.find(device.GetAddress());
+    BtAddr oobPeer = ConvertToBtAddr(device);
+    const bool isOobPair = pimpl->oobPair_->State(oobPeer.addr, oobPeer.type) != 0;
+    pimpl->oobPair_->Invalidate(oobPeer.addr);
     if (it == devices_.end() || (it->second->GetPairedStatus() != PAIR_PAIRING)) {
         HILOGE("failed, because of not in PAIR_PAIRING!");
         return false;
     }
 
     it->second->SetPairedStatus(PAIR_CANCELING);
+    if (isOobPair) {
+        return GAPIF_CancelAuthenticationReq(&oobPeer) == BT_SUCCESS;
+    }
     int pairConfirmState = it->second->GetPairConfirmState();
     if (pairConfirmState == PAIR_CONFIRM_STATE_USER_CONFIRM_REPLY) {
         BtAddr btAddr = ConvertToBtAddr(device);
@@ -2007,7 +2070,9 @@ bool ClassicAdapter::PairRequestReply(const RawAddress &device, bool accept) con
 
     BtAddr btAddr = ConvertToBtAddr(device);
     int io = adapterProperties_.GetIoCapability();
-    bool ret = (GAPIF_IOCapabilityRsp(&btAddr, accept, io, GAP_OOB_DATA_NOT_PRESENT, GAP_MITM_REQUIRED) == BT_SUCCESS);
+    const uint8_t curve = pimpl->oobPair_->Curve(btAddr.addr, btAddr.type);
+    accept = accept && pimpl->oobPair_->State(btAddr.addr, btAddr.type) != 2;
+    bool ret = (GAPIF_IOCapabilityRsp(&btAddr, accept, io, curve, GAP_MITM_REQUIRED) == BT_SUCCESS);
     ClassicUtils::CheckReturnValue("ClassicAdapter", "GAPIF_IOCapabilityRsp", ret);
 
     return ret;
@@ -2197,14 +2262,16 @@ void ClassicAdapter::SetIoCapability(const BtAddr &addr)
         remoteDevice->SetPairedStatus(PAIR_PAIRING);
     }
 
-    if (bondFromLocal == false) {
+    const uint8_t curve = pimpl->oobPair_->Curve(addr.addr, addr.type);
+    const bool oobInvalid = pimpl->oobPair_->State(addr.addr, addr.type) == 2;
+    if (bondFromLocal == false && curve == GAP_OOB_DATA_NOT_PRESENT && !oobInvalid) {
         SendPairRequested(ADAPTER_BREDR, rawAddr);
     } else {
         int io = adapterProperties_.GetIoCapability();
-        if (remoteDevice->GetPairedStatus() == PAIR_CANCELING) {
+        if (remoteDevice->GetPairedStatus() == PAIR_CANCELING || oobInvalid) {
             ret = (GAPIF_IOCapabilityRsp(&addr, false, io, GAP_OOB_DATA_NOT_PRESENT, GAP_MITM_REQUIRED) == BT_SUCCESS);
         } else {
-            ret = (GAPIF_IOCapabilityRsp(&addr, true, io, GAP_OOB_DATA_NOT_PRESENT, GAP_MITM_REQUIRED) == BT_SUCCESS);
+            ret = (GAPIF_IOCapabilityRsp(&addr, true, io, curve, GAP_MITM_REQUIRED) == BT_SUCCESS);
         }
         ClassicUtils::CheckReturnValue("ClassicAdapter", "GAPIF_IOCapabilityRsp", ret);
     }

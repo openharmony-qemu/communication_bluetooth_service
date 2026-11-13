@@ -14,6 +14,8 @@
  */
 
 #include <thread>
+#include <algorithm>
+#include <cctype>
 
 #include "bluetooth_a2dp_sink_server.h"
 #include "bluetooth_a2dp_source_server.h"
@@ -940,7 +942,18 @@ int32_t BluetoothHostServer::GetLocalAddress(std::string &addr)
 
 int32_t BluetoothHostServer::GenerateLocalOobData(int32_t transport, const sptr<IBluetoothOobObserver> &observer)
 {
-    return NO_ERROR;
+    if (transport != BT_TRANSPORT_BREDR && transport != BT_TRANSPORT_BLE) {
+        return BT_ERR_INVALID_PARAM;
+    }
+    if (observer == nullptr) {
+        return BT_ERR_INVALID_PARAM;
+    }
+    if ((transport == BT_TRANSPORT_BREDR && !IsBtEnabled()) ||
+        (transport == BT_TRANSPORT_BLE && !IsBleEnabled())) {
+        return BT_ERR_INVALID_STATE;
+    }
+    // No controller generation is currently wired to this observer API.
+    return BT_ERR_API_NOT_SUPPORT;
 }
 
 int32_t BluetoothHostServer::EnableBle(bool noAutoConnect, bool isAsync, const std::string &callingName)
@@ -1444,9 +1457,65 @@ int32_t BluetoothHostServer::GetPairState(int32_t transport, const std::string &
 int32_t BluetoothHostServer::StartPair(int32_t transport, const BluetoothRawAddress &bluetoothRawAddress,
     const BluetoothOobData &oobData)
 {
-    if (oobData.HasOobData()) {
-        HILOGE("pairDeviceOutOfBand not supported");
-        return BT_ERR_API_NOT_SUPPORT;
+    const bool isOob = oobData.HasOobData() || oobData.HasAddressWithType() || oobData.HasConfirmHash() ||
+        oobData.HasRandomHash() || oobData.HasDeviceName();
+    if (isOob) {
+        int32_t permission = PermissionManager::VerifyMultiPermissions(CHECK_PERM(true, {}, {ACCESS_BLUETOOTH}));
+        if (permission != NO_ERROR) {
+            return permission;
+        }
+        if (transport != BT_TRANSPORT_BREDR && transport != BT_TRANSPORT_BLE) {
+            return BT_ERR_INVALID_PARAM;
+        }
+        auto raw = oobData.GetAddressWithType();
+        auto confirmation = oobData.GetConfirmationHash();
+        auto randomizer = oobData.GetRandomizerHash();
+        if (!oobData.HasOobData() || raw.size() != 7 || confirmation.size() != 16 ||
+            (oobData.HasRandomHash() && randomizer.size() != 16) || raw[6] > 1 ||
+            (transport == BT_TRANSPORT_BREDR && raw[6] != 0) ||
+            (oobData.GetOobDataType() != OHOS::bluetooth::P192 && oobData.GetOobDataType() != OHOS::bluetooth::P256) ||
+            oobData.GetDeviceRole() > OHOS::bluetooth::DEVICE_ROLE_BOTH_PREFER_CENTRAL ||
+            (oobData.HasDeviceName() && (oobData.GetDeviceName().empty() || oobData.GetDeviceName().size() > 256))) {
+            return BT_ERR_INVALID_PARAM;
+        }
+        PairingOobData data;
+        std::reverse_copy(raw.begin(), raw.begin() + 6, data.peer.begin());
+        data.addressType = raw[6];
+        data.curve = oobData.GetOobDataType();
+        data.hasRandomizer = oobData.HasRandomHash();
+        std::copy(confirmation.begin(), confirmation.end(), data.confirmation.begin());
+        if (data.hasRandomizer) {
+            std::copy(randomizer.begin(), randomizer.end(), data.randomizer.begin());
+        }
+        std::string target = bluetoothRawAddress.GetAddress();
+        std::transform(target.begin(), target.end(), target.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        // This fixed service has no virtual-to-raw mapping. Reject a mismatch
+        // rather than applying one peer's OOB material to another device.
+        if (target != RawAddress::ConvertToString(data.peer.data()).GetAddress()) {
+            return BT_ERR_INVALID_PARAM;
+        }
+        if ((transport == BT_TRANSPORT_BREDR && !IsBtEnabled()) ||
+            (transport == BT_TRANSPORT_BLE && !IsBleEnabled())) {
+            return BT_ERR_INVALID_STATE;
+        }
+        if (transport == BT_TRANSPORT_BLE && data.curve != OHOS::bluetooth::P256) {
+            // LE legacy requires a TK, which this C/R SDK shape cannot carry.
+            return BT_ERR_API_NOT_SUPPORT;
+        }
+        if (!data.hasRandomizer) {
+            // This backend cannot validate C without its matching R.
+            return BT_ERR_API_NOT_SUPPORT;
+        }
+        RawAddress device(target);
+        auto classic = IAdapterManager::GetInstance()->GetClassicAdapterInterface();
+        auto ble = IAdapterManager::GetInstance()->GetBleAdapterInterface();
+        if (transport == BT_TRANSPORT_BREDR && IsBtEnabled() && classic) {
+            return classic->StartPairOutOfBand(device, data) ? NO_ERROR : BT_ERR_INTERNAL_ERROR;
+        }
+        if (transport == BT_TRANSPORT_BLE && IsBleEnabled() && ble) {
+            return ble->StartPairOutOfBand(device, data) ? NO_ERROR : BT_ERR_INTERNAL_ERROR;
+        }
+        return BT_ERR_INVALID_STATE;
     }
     std::string address = bluetoothRawAddress.GetAddress();
     HILOGI("transport: %{public}d, address: %{public}s", transport, GetEncryptAddr(address).c_str());

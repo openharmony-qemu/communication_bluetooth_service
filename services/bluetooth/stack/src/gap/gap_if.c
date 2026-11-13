@@ -890,6 +890,35 @@ int GAPIF_RemoteOobRsp(const BtAddr *addr, uint8_t accept, const GapOOBData *dat
     return ret;
 }
 
+static void GapRemoteOobExtendedRspTask(void *ctx)
+{
+    GapRemoteExtandedOobRspInfo *info = ctx;
+    info->result = GAP_RemoteOobExtendedRsp(info->addr, info->accept, info->data192, info->data256);
+}
+
+int GAPIF_RemoteOobExtendedRsp(const BtAddr *addr, uint8_t accept,
+    const GapOOBData *data192, const GapOOBData *data256)
+{
+    if (addr == NULL || (accept == GAP_ACCEPT && data192 == NULL && data256 == NULL)) {
+        return GAP_ERR_INVAL_PARAM;
+    }
+    GapRemoteExtandedOobRspInfo *ctx = MEM_MALLOC.alloc(sizeof(GapRemoteExtandedOobRspInfo));
+    if (ctx == NULL) {
+        return BT_NO_MEMORY;
+    }
+    (void)memset_s(ctx, sizeof(*ctx), 0, sizeof(*ctx));
+    ctx->addr = (BtAddr *)addr;
+    ctx->accept = accept;
+    ctx->data192 = (GapOOBData *)data192;
+    ctx->data256 = (GapOOBData *)data256;
+    int ret = GapRunTaskBlockProcess(GapRemoteOobExtendedRspTask, ctx);
+    if (ret == BT_SUCCESS) {
+        ret = ctx->result;
+    }
+    MEM_MALLOC.free(ctx);
+    return ret;
+}
+
 static void GapPinCodeRspTask(void *ctx)
 {
     GapPinCodeRspInfo *info = ctx;
